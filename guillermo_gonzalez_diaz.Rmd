@@ -1,0 +1,280 @@
+---
+title: 'PRÁCTICA AIRBNB'
+author: "Guillermo González Díaz"
+date: "2021/12/02"
+output:
+  html_document:
+    toc: yes
+    toc_depth: '2'
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+subtitle: _Extracción, Transformación y Carga_
+---
+```{css, echo = FALSE}
+.orangebox {
+  border: 1px solid rgb(0, 102, 102);
+  padding: 10px 10px;
+  background-color: #FFFCCC;
+    border-radius: 5px;
+}
+```
+
+                       
+```{r, results='hide', message=FALSE, echo=FALSE}
+# Cargamos librerías:
+library(tidyverse)
+library(data.table)
+library(ggplot2)
+
+# Creamos conexión con nuestra BDD
+conn <- DBI::dbConnect(RSQLite::SQLite(),
+                       "~/Desktop/etl/practica_asignatura/airbnb.sqlite")
+DBI::dbListTables(conn)  
+```
+
+# _Bloque 1: Extracción_
+
+### Ejercicios 1 Y 2:
+
+::: {.orangebox}
+Extraemos de la base de datos airbnb.sqlite, las tablas de 'Reviews' y 'Listings',
+que contienen información relativa a la valoración de alojamientos airbnb en Madrid 
+desde enero de 2011 hasta junio de 2021. 
+
+Este es el código utilizado para ello:
+:::
+
+```{r, echo = TRUE,  message=FALSE}
+# Cargamos la tabla Df listings:
+df_listings <- 
+  as.data.frame(tbl(conn, sql("
+                             SELECT list.price, list.number_of_reviews,
+                             list.room_type, list.review_scores_rating, 
+                             hood.neighbourhood_group
+                             FROM Listings as list
+                             INNER JOIN Hoods as hood
+                             ON hood.neighbourhood = list.neighbourhood_cleansed")))
+
+# Cargamos la tabla Df reviews:
+df_reviews <- 
+  as.data.frame(tbl(conn, sql("
+                             SELECT COUNT(DISTINCT(rev.id)) AS num_reviews,
+                             strftime('%Y-%m', date) as fecha, 
+                             hood.neighbourhood_group as district
+                             FROM Reviews as rev
+                             INNER JOIN Listings as list
+                             ON rev.listing_id = list.id
+                             INNER JOIN Hoods as hood
+                             ON hood.neighbourhood = list.neighbourhood_cleansed
+                             WHERE date > '2010-12-31'
+                             GROUP BY fecha , hood.neighbourhood_group")))  
+```
+
+```{r, results='hide', message=FALSE, echo=FALSE}
+# Cambio un poco el orden de las columnas:
+df_listings <- df_listings %>% 
+  relocate(neighbourhood_group, .before = price) %>% 
+  relocate(room_type, .before = price)
+
+```
+
+# _Bloque 2: Transformación_
+
+### Ejercicio 3: Transformación Listings:
+
+::: {.orangebox}
+La tabla listings contiene la fila 'price', que tiene un formato incómodo. Tiene 
+puntos, y aparte tiene el símbolo de $. Con el siguiente código, arreglamos ambas cosas:
+:::
+
+```{r, echo = TRUE,  message=FALSE}
+# Comprobamos clase inicial
+class(df_listings$price)
+
+# Realizamos la transformación:
+df_listings$price <- as.numeric(gsub("[\\$,]", "", df_listings$price))
+
+# Comprobamos clase después del cambio
+class(df_listings$price)
+
+# Vemos los cambios con un glimpse:
+glimpse(df_listings)
+```
+
+### Ejercicio 4: Transformación Listings, parte 2
+### Opción A: 
+::: {.orangebox}
+Ahora, viendo el glimpse de arriba, nos fijamos que tenemos NAs tanto en la fila de número de reviews como en la de reviews scores rating. El objetivo es, reemplazar esos
+Nas con valores reales escogidos aleatoriamente dentro de la misma tabla. Es decir, si hay un NA en número de reviews, se cogerá un valor aleatorio de esa misma fila.
+
+Usaremos sample, cogiendo valores de esa columna que no sean Nas, en una cantidad equivalente a la suma de Nas de esa columna, y los reemplazamos aleatoriamente. Luego comprobamos que efectivamente no quedan Nas.
+El código: 
+:::
+
+```{r, echo = TRUE,  message=FALSE}
+# Sustituimos en num_reviews:
+df_listings$number_of_reviews[is.na(df_listings$number_of_reviews)] <-
+  sample(df_listings$number_of_reviews                
+         [!is.na(df_listings$number_of_reviews)],     
+         sum(is.na(df_listings$number_of_reviews)),   
+         replace=F)
+
+# comprobación:
+sum(is.na(df_listings$number_of_reviews)) 
+
+# Sustituimos en reviews_scores_rating:
+df_listings$review_scores_rating[is.na(df_listings$review_scores_rating)] <-
+  sample(df_listings$review_scores_rating
+         [!is.na(df_listings$review_scores_rating)],
+         sum(is.na(df_listings$review_scores_rating)),
+         replace=F)
+
+# Comprobamos: 
+sum(is.na(df_listings$review_scores_rating)) 
+```
+
+### Opción B: 
+::: {.orangebox}
+Ahora, imputamos los valores missing de las mismas columnas que antes, pero en este caso dependerá del tipo de room_type en el que caiga ese Na. Por ejemplo si tenemos un Na en número de reviews que cae en 'Private room', habrá que sustituirlo por valores aleatorios dentro de todos los que room_type sea 'Private room'. 
+
+En este caso he creado un bucle que, recorre los tipos de room que tenemos. Luego, nuestras columnas que contienen Nas. Creaamos un vector booliano con esos Nas que se encuentra, e igual que en el apartado A, sustituirá esos Nas con un sample creado a partir de los valores no nulos de la room type que esté comprobando el bucle en ese momento:
+:::
+
+```{r, echo = TRUE,  message=FALSE}
+for (type in unique(df_listings$room_type)){ 
+  for (col in c("number_of_reviews", "review_scores_rating")){ 
+    na_bool <- is.na(df_listings[ ,col]) 
+    if(all(na_bool == FALSE)){
+      next
+    }
+    sample_values <- df_listings[df_listings$room_type == type & !na_bool, col]  
+    fill_values <- sample(sample_values, sum(na_bool), replace = TRUE) 
+    df_listings[na_bool, col] <- fill_values 
+  }
+}
+
+sum(is.na(df_listings$number_of_reviews & df_listings$review_scores_rating))
+```
+
+### Ejercicio 5: Transformación Listings, parte 3
+
+::: {.orangebox}
+Teniendo 'price' en un formato apropiado para operar, calculamos 2 nuevas columnas: nota media ponderada y precio mediano.
+
+La tabla resultante tendrá cuatro columnas: distrito (llamada habitualmente neighbourhood_group), tipo de alojamiento (room_type), nota media y precio mediano. Esta tabla puede ser útil para estudiar diferencias entre mismo un tipo de alojamiento en función del distrito en el que esté.
+:::
+
+```{r, echo = TRUE,  message=FALSE}
+df_listings <- df_listings %>%
+  group_by(neighbourhood_group, room_type) %>% 
+  dplyr::summarise(precio_mediano = median(price),
+                   media_ponderada =
+                     weighted.mean(review_scores_rating,number_of_reviews))
+
+# Comprobamos el resultado: 
+glimpse(df_listings)
+```
+
+### Ejercicio 6: Transformación Reviews, parte 1
+
+::: {.orangebox}
+Como nuestros datos acaban en julio de 2021, crear una 'predicción' para agosto de este año. Como no es una asignatura de predicción de series temporales, nos conformamos con que los valores de agosto sean los mismos que han sido para julio. Por ejemplo, si en julio teníamos 888 reviews en centro, en centro de agosto tendremos igualmente 888 reviews. 
+
+Este ha sido el código utilizado y la explicación con anotaciones:
+:::
+
+```{r, echo = TRUE,  message=FALSE}
+# Extraemos las reviews de julio:
+reviews_julio <- df_reviews %>%
+  group_by(district, fecha) %>% 
+  filter(fecha >= "2021-07")
+
+# Guardamos cuántos barrios hay en total:
+district <- reviews_julio$district
+
+# Guardamos cuántas reviews teníamos en julio:
+num_reviews <- reviews_julio$num_reviews
+
+# Creamos vector de fechas, cambiando julio por agosto: 
+fecha <- reviews_julio$fecha
+fecha <- gsub("-07", "-08", fecha)
+
+# Repetimos agosto tantas veces como teníamos repetido julio.
+nrow(reviews_julio)
+mes <- rep("08", 122)
+
+# Ya con estos 3 vectores, creamos el dataframe para agosto:
+prediccion_agosto <- data.frame(district, fecha, num_reviews)
+
+
+# Ahora combinamos este dataframe con el original:
+df_reviews <- rbind(prediccion_agosto, df_reviews)
+df_reviews <- df_reviews %>% 
+  group_by(fecha)
+
+# Comprobamos que se ha añadido:
+head(df_reviews)
+```
+
+### Ejercicio 7: Transformación Reviews, parte 2
+
+::: {.orangebox}
+Hay casos que no tienen dato, por ejemplo, febrero de 2011 en Arganzuela. Como no hay dato, asumiremos que es 0. Siguiendo esta idea, añadimos todos los registros necesarios a la tabla.
+:::
+
+```{r, echo = TRUE,  message=FALSE}
+# Chequeamos el mínimo y máximo de la columna fecha:
+min(df_reviews$fecha)
+max(df_reviews$fecha) # vamos de 2011-01 a 2021-07
+
+# Creamos un vector de fechas que vaya desde 2011-01 : 2021-07
+fechas_posibles <- seq(as.Date("2011-01-01"), as.Date("2021-07-01"), by="months")
+
+# Corregimos el formato:
+fechas_posibles <- format(fechas_posibles, "%Y-%m") 
+fechas_posibles <- char(fechas_posibles)
+
+# Distritos posibles:
+distritos_posibles <- unique(df_reviews$district)
+
+# Juntamos los dos en un dataframe con las combinaciones posibles:
+comb_pos <- expand_grid(distritos_posibles, fechas_posibles)
+colnames(comb_pos) <- c("district", "fecha")
+
+
+# Lo juntamos con el df final:
+df_reviews <- df_reviews %>% 
+  bind_rows(comb_pos)
+
+# Chequeamos NAS. 
+sum(is.na(df_reviews$num_reviews))
+
+# Sustituimos NAS por 0s:
+df_reviews[is.na(df_reviews)] = 0
+```
+
+# _Bloque 3: Carga_
+
+### Ejercicio 8: Carga 
+
+::: {.orangebox}
+Sube a la base de datos las dos tablas que has creado. No sobreescibas las que hay: crea dos tablas nuevas. Haz una prueba de que todo está en orden, haciendo SELECT * FROM nombre_tabla LIMIT 10 para cada tabla. Si la fecha tiene un formato raro, es posible que necesites definirla en el data frame como tipo texto.
+:::
+
+```{r}
+DBI::dbWriteTable(con = conn, name = 'df_listings', value= df_listings, overwrite=FALSE)
+DBI::dbWriteTable(con = conn, name = 'df_reviews', value= df_reviews, overwrite=FALSE)
+
+query_check <- tbl(conn, sql("
+                             SELECT * 
+                             FROM df_listings"))  
+query_check %>% collect() 
+
+query2_check <- tbl(conn, sql("
+                             SELECT * 
+                             FROM df_reviews")) 
+query2_check %>% collect() 
+```
+
+
